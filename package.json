@@ -1,0 +1,25 @@
+{
+  "name": "s3-pit-test",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node lib/test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^10.12.2",
+    "aws-sdk": "^2.348.0",
+    "bluebird": "^3.5.2",
+    "delete-aws-bucket": "github:mvayngrib/delete-aws-bucket",
+    "empty-aws-bucket": "github:mvayngrib/empty-aws-bucket",
+    "execa": "^1.0.0",
+    "lodash": "^4.17.11",
+    "source-map-support": "^0.5.9",
+    "tape": "^4.9.1",
+    "tslib": "^1.9.3",
+    "uuid": "^3.3.2"
+  }
+}
