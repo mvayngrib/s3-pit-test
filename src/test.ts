@@ -23,7 +23,7 @@ type Pairs = Pair[]
 type Diff = {
   missing: Item[]
   extra: Item[]
-  notEqual: { source: Item, dest: Item }[]
+  notEqual: { expected: Item, actual: Item }[]
 }
 
 const LOCALSTACK_ENDPOINT = 'http://localhost:4572'
@@ -42,7 +42,10 @@ const s3 = new AWS.S3({
 
 const prettify = obj => JSON.stringify(obj, null, 2)
 const genBucketName = (suffix: string) => `mvayngrib-s3-pit-test-bucket-12345-${suffix}`
-const createVersionedBucketIfNotExists = async (Bucket: string) => {
+const SOURCE = genBucketName('source')
+const DEST = genBucketName('dest')
+
+const createBucketIfNotExists = async (Bucket: string) => {
   try {
     await s3.headBucket({ Bucket }).promise()
   } catch (err) {
@@ -50,19 +53,35 @@ const createVersionedBucketIfNotExists = async (Bucket: string) => {
       await s3.createBucket({ Bucket }).promise()
     }
   }
+}
 
+const enableVersioning = async (Bucket: string) => {
   await s3.putBucketVersioning({
     Bucket,
     VersioningConfiguration: {
       Status: 'Enabled'
     }
   }).promise()
+}
 
-  return Bucket
+const createVersionedBucketIfNotExists = async (Bucket: string) => {
+  await createBucketIfNotExists(Bucket)
+  await enableVersioning(Bucket)
 }
 
 // const deleteBucket = async (bucket: string) => _deleteBucket({ s3, bucket })
 const emptyBucket = (bucket: string) => _emptyBucket({ s3, bucket })
+const deleteAllCurrentVersions = async (bucket: string) => {
+  // const params: AWS.S3.ListObjectsV2Request
+  await mapBucket({
+    bucket,
+    map: async ({ Key }) => {
+      if (typeof Key === 'string') {
+        return s3.deleteObject({ Bucket: bucket, Key }).promise()
+      }
+    }
+  })
+}
 
 const ensureEmptyBucket = async (bucket: string) => {
   await createVersionedBucketIfNotExists(bucket)
@@ -102,7 +121,7 @@ const restore = async ({ source, dest, start, end, endpoint }: {
   endpoint?: string
 }) => {
   const env = {}
-  const args = ['-b', source, '-d', `s3://${dest}`, '-f', start, '-t', end, '--restore-deleted']
+  const args = ['-b', source, '-d', `s3://${dest}`, '-f', start, '-t', end]//, '--restore-deleted']
   if (endpoint) {
     args.push('--endpoint', ENDPOINT)
   }
@@ -111,59 +130,78 @@ const restore = async ({ source, dest, start, end, endpoint }: {
   await execa('./s3-pit-restore', args, { env })
 }
 
+const verify = async ({ bucket, expectedItems }: {
+  bucket: string
+  expectedItems: Item[]
+}) => {
+  const actual = await dumpBucket(DEST)
+  const diff = compare(expectedItems, actual)
+  verifyDiff(diff)
+  printDiff(diff)
+}
+
 const isoDateNow = () => new Date().toISOString()
-const dumpBucket = async (Bucket: string) => {
-  const params:AWS.S3.ListObjectsV2Request = {
-    Bucket
-  }
+const mapBucket = async <T>({ bucket, map }: {
+  bucket: string
+  map: (obj: AWS.S3.Object) => Promise<T>
+}):Promise<T[]> => {
+  const Bucket = bucket
+  const params:AWS.S3.ListObjectsV2Request = { Bucket }
 
-  const gets:Promise<AWS.S3.GetObjectOutput[]> = []
-  const get = async (Key: string):Promise<Item> => {
-    const result = await s3.getObject({ Bucket, Key }).promise()
-    return { ...result, Key } as Item
-  }
-
-  let result:AWS.S3.ListObjectsV2Output
+  let batch:AWS.S3.ListObjectsV2Output
+  const batchPromises:Promise<T[]>[] = []
   do {
-    result = await s3.listObjectsV2({ Bucket }).promise()
-    let { Contents=[] } = result
-    let keys = Contents.filter(i => i.Key && i.Key.length).map(i => i.Key) as string[]
-    gets.push(Promise.all(keys.map(get)))
-    params.ContinuationToken = result.ContinuationToken
-  } while (result.ContinuationToken)
+    batch = await s3.listObjectsV2({ Bucket }).promise()
+    let { Contents=[] } = batch
+    batchPromises.push(Promise.all(Contents.map(map)))
+    params.ContinuationToken = batch.ContinuationToken
+  } while (batch.ContinuationToken)
 
-  const bodies = await Promise.all(gets)
-  // flatten
-  return bodies.reduce((all:Item[], some: Item[]) => all.concat(some), []) as Item[]
+  const results = await Promise.all(batchPromises)
+  return results.reduce((all, some) => all.concat(some), [])
+}
+
+const dumpBucket = async (bucket: string) => {
+  const items = await mapBucket({
+    bucket,
+    map: async ({ Key }) => {
+      if (typeof Key === 'string') {
+        const result = await s3.getObject({ Bucket: bucket, Key }).promise()
+        return { ...result, Key }
+      }
+    }
+  })
+
+  return items.filter(_.identity)
 }
 
 const printDiff = ({ missing, extra, notEqual }: Diff) => {
   missing.forEach(item => console.warn(`missing: ${item.Key}`))
   extra.forEach(item => console.warn(`extra: ${item.Key}`))
-  notEqual.forEach(({ source, dest }) => {
+  notEqual.forEach(({ expected, actual }) => {
       console.warn(`item mismatched:
-Source: ${prettify(source)}
-Dest: ${prettify(dest)}`)
+expected: ${prettify(expected)}
+actual: ${prettify(actual)}`)
 
   })
 }
 
-const compare = (source: Item[], dest: Item[]):Diff => {
-  const sourceMap = new Map(source.map(item => [item.Key, item]) as Pairs)
-  const destMap = new Map(dest.map(item => [item.Key, item]) as Pairs)
-  const missing = source.filter(({ Key }) => !destMap.has(Key))
-  const extra = dest.filter(({ Key }) => !sourceMap.has(Key))
-  const notEqual = dest.filter(item => {
+const compare = (expected: Item[], actual: Item[]):Diff => {
+  const expectedMap = new Map(expected.map(item => [item.Key, item]) as Pairs)
+  const actualMap = new Map(actual.map(item => [item.Key, item]) as Pairs)
+  const missing = expected.filter(({ Key }) => !actualMap.has(Key))
+  const extra = actual.filter(({ Key }) => !expectedMap.has(Key))
+  const notEqual = actual.filter(item => {
     if (extra.includes(item)) return
 
-    const sourceItem = sourceMap.get(item.Key)
-    if (_.isMatch(item, sourceItem)) {
+    const expectedItem = expectedMap.get(item.Key)
+    if (_.isMatch(item, expectedItem)) {
       return true
     }
   })
   .map(item => ({
-    source: sourceMap.get(item.Key),
-    dest: item,
+    expected: expectedMap.get(item.Key),
+    actual: item,
   }))
 
   return {
@@ -187,26 +225,19 @@ const putItems = (Bucket: string, tree:Items) => Promise.map(
   { concurrency: 100 }
 )
 
-const verifyDiff = (t, result: Diff) => {
-  t.equal(result.missing.length, 0, 'none missing')
-  t.equal(result.extra.length, 0, 'no extras')
-  t.equal(result.notEqual.length, 0, 'values match')
+const verifyDiff = (result: Diff) => {
+  // t.equal(result.missing.length, 0, 'none missing')
+  // t.equal(result.extra.length, 0, 'no extras')
+  // t.equal(result.notEqual.length, 0, 'values match')
   if (result.missing.length || result.extra.length || result.notEqual.length) {
-    throw new Error('failed')
+    throw new Error(`failed: ${prettify(result)}`)
   }
 }
 
 test('pit restore', async t => {
-  const verify = async (expected) => {
-    const actual = await dumpBucket(dest)
-    debugger
-    const diff = compare(expected, actual)
-    verifyDiff(t, diff)
-    printDiff(diff)
-  }
-
-  const source = genBucketName('source')
-  const dest = genBucketName('dest')
+  const batchSize = 10
+  const source = SOURCE
+  const dest = DEST
   log('emptying source and dest buckets')
   await Promise.all([ensureEmptyBucket(source), ensureEmptyBucket(dest)])
 
@@ -216,7 +247,7 @@ test('pit restore', async t => {
 
   // put1: first batch
   log(`putting 1st batch: > ${timeStart}`)
-  const put1 = genObjects({ count: 100, offset: 0 })
+  const put1 = genObjects({ count: batchSize, offset: 0 })
   await putItems(source, put1)
   await waitGracePeriod()
   const timeAfterPut1 = isoDateNow()
@@ -225,52 +256,68 @@ test('pit restore', async t => {
   await waitGracePeriod()
 
   // put2: half new, half overwrites
+  const put2 = genObjects({ count: batchSize, offset: Math.floor(batchSize / 2) })
   log(`putting 2nd batch: > ${timeAfterPut1}`)
-  const put2 = genObjects({ count: 100, offset: 50 })
   await putItems(source, put2)
   await waitGracePeriod()
   const timeAfterPut2 = isoDateNow()
-  const timeBeforeEmptying = timeAfterPut2
+  const timeBeforeDelete = timeAfterPut2
 
   await waitGracePeriod()
 
   // empty: erase all items
-  log('emptying source bucket')
-  await emptyBucket(source)
+  log(`deleting all current versions from source bucket: > ${timeBeforeDelete}`)
+  await deleteAllCurrentVersions(source)
   await waitGracePeriod()
   const timeAfterEmptying = isoDateNow()
   const timeBeforePut3 = timeAfterEmptying
   await waitGracePeriod()
 
   // put3: new items, overlapping range with put1/put2
-  log('putting 3rd batch')
-  const put3 = genObjects({ count: 100, offset: 75 })
+  log(`putting 3rd batch: > ${timeBeforePut3}`)
+  const put3 = genObjects({ count: batchSize, offset: Math.floor(batchSize / 4) })
   await putItems(source, put3)
   await waitGracePeriod()
   const timeAfterPut3 = isoDateNow()
   await waitGracePeriod()
 
-  log('beginning verifications')
+  log(`beginning verifications: ${timeAfterPut3}`)
 
   // verify 1
   await emptyBucket(dest)
+  await waitGracePeriod()
   await restore({ source, dest, start: timeStart, end: timeAfterPut1 })
-  await verify(put1)
+  await verify({
+    bucket: dest,
+    expectedItems: put1
+  })
 
   // verify 2
   await emptyBucket(dest)
+  await waitGracePeriod()
   await restore({ source, dest, start: timeStart, end: timeAfterPut2 })
-  await verify(_.uniqBy(put2.concat(put1), 'Key'))
+  await verify({
+    bucket: dest,
+    expectedItems: _.uniqBy([...put2, ...put1], 'Key')
+  })
 
   // verify 3
   await emptyBucket(dest)
+  await waitGracePeriod()
   await restore({ source, dest, start: timeStart, end: timeAfterEmptying })
-  await verify([])
+  await verify({
+    bucket: dest,
+    expectedItems: []
+  })
 
   // verify 4
   await emptyBucket(dest)
+  await waitGracePeriod()
   await restore({ source, dest, start: timeStart, end: timeAfterPut3 })
-  await verify(put3)
+  await verify({
+    bucket: dest,
+    expectedItems: put3
+  })
 
   await Promise.all([emptyBucket(source), emptyBucket(dest)])
   t.end()

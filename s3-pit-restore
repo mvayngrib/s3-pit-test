@@ -244,14 +244,13 @@ def do_restore():
                 # Object was not updated during pit window
                 continue
 
-            if not args.restore_deleted:
-                while deletemarkers and (dmarker["Key"] < obj["Key"] or dmarker["LastModified"] > pit_end_date):
-                    dmarker = deletemarkers.pop(0)
+            while deletemarkers and (dmarker["Key"] < obj["Key"] or dmarker["LastModified"] > pit_end_date):
+                dmarker = deletemarkers.pop(0)
 
-                if dmarker["Key"] == obj["Key"] and dmarker["LastModified"] > obj["LastModified"]:
-                    # The most recent operation on this key was a delete
-                    last_obj = dmarker
-                    continue
+            if dmarker["Key"] == obj["Key"] and dmarker["LastModified"] > obj["LastModified"]:
+                # The most recent operation on this key was a delete
+                last_obj = dmarker
+                continue
 
             # This version needs to be restored..
             last_obj = obj
@@ -294,7 +293,6 @@ if __name__=='__main__':
     parser.add_argument('-d', '--dest', help='path where recovering to; can be an s3 bucket address', required=True)
     parser.add_argument('-e', '--enable-glacier', help='enable recovering from glacier', action='store_true')
     parser.add_argument('-v', '--verbose', help='print verbose informations from s3 objects', action='store_true')
-    parser.add_argument('--restore-deleted', help='restore the latest non-deleted version', action='store_true')
     parser.add_argument('--dry-run', help='execute query without transferring files', action='store_true')
     parser.add_argument('--debug', help='enable debug output', action='store_true')
     parser.add_argument('--test', help='s3 pit restore testing', action='store_true')
